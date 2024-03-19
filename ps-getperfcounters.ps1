@@ -1,4 +1,4 @@
-## This is an AWS-provided set of scripts to help customers and partners diagnose client-side performance issues, such as IO constraints and network saturation, specifically when using DMS to migrate customer workloads to AWS. 
+## This is an AWS-provided set of scripts to help customers and partners diagnose client-side performance issues, such as IO constraints and network saturation, specifically when using DMS to migrate customer workloads to AWS. However, this utility can be used to diagnore any Windows-specific performance issues. 
 
 ##Depending on your source, even if another AWS account, you may have had your default counters suppressed or otherwise, disabled by GPO or registry key. This will reset all performance monitor counters to OS defaults, resynch all performance monitors, restart the Windows Management Instrumentation (WMI) service, restart the Performance Logs & Alerts (PLA) service, and return you to your home directory. 
 
@@ -14,24 +14,24 @@ cd ~/
 ##The next portion of the script will give you, the user, insight into what is happening in the most commonly found bottlenecks for customers and partners. You will pull the statistics for key Physical Disk, CPU, Memory, and Network Interface counters. Note: unless MSSQL is installed on C: (and hopefully isn't) - you won't find much here. Feel free to add more counters, but these are the most frequent counters used for identifying bottlenecks on migrations. 
 
 $counters = @(
-   '\PhysicalDisk(**)\% Idle Time'
-   '\PhysicalDisk(**)\Avg. Disk sec/Read'
-   '\PhysicalDisk(**)\Avg. Disk sec/Write'
-   '\PhysicalDisk(**)\Avg. Disk sec/Transfer'
-   '\PhysicalDisk(**)\Disk Reads/sec'
-   '\PhysicalDisk(**)\Disk Writes/sec'
-   '\PhysicalDisk(**)\Disk Transfers/sec'
-   '\PhysicalDisk(**)\Current Disk Queue Length'
-   '\PhysicalDisk(**)\Avg. Disk Queue Length'
+   '\PhysicalDisk(**)\% Idle Time'
+   '\PhysicalDisk(**)\Avg. Disk sec/Read'
+   '\PhysicalDisk(**)\Avg. Disk sec/Write'
+   '\PhysicalDisk(**)\Avg. Disk sec/Transfer'
+   '\PhysicalDisk(**)\Disk Reads/sec'
+   '\PhysicalDisk(**)\Disk Writes/sec'
+   '\PhysicalDisk(**)\Disk Transfers/sec'
+   '\PhysicalDisk(**)\Current Disk Queue Length'
+   '\PhysicalDisk(**)\Avg. Disk Queue Length'
    '\Processor(**)\% Processor time'
    '\Processor(**)\% Privileged time'
    '\Processor(**)\% user time'
    '\Processor(**)\% idle time'
    '\Processor(**)\DPCs Queued/sec'
-   '\Memory\Available Bytes'
-   '\Memory\Pages/sec'
-   '\Network Interface(**)\Bytes Total/sec'
-   '\Network Interface(**)\Output Queue Length'
+   '\Memory\Available Bytes'
+   '\Memory\Pages/sec'
+   '\Network Interface(**)\Bytes Total/sec'
+   '\Network Interface(**)\Output Queue Length'
  ) 
 
 ##This final section will take the counters, declared as variables from the previous section, and make it human readable, and re-name a few of the column headers. We will then pull counters over 3 different intervals, and is most useful for customers to run this when they start seeing problems with their MSSQL server when DMS is in use. Finally, we will declare a variable for the output's filename, append today's date to it, and then call that variable to save the results to a file for reference.  
@@ -49,4 +49,4 @@ $samples = foreach ($counter in $counters) {
 $filename = "perfmon_results-" + (Get-Date).tostring("dd-MM-yyyy-hh-mm-ss") 
 $samples | Out-File $filename
 
-##Please use the output of the perfmon.txt file to open a support case if needed to further troubleshoot. Without this granular information, it is difficult in order to receive timely assitance. 
+##Please use the output of the perfmon  file to open a support case if needed to further troubleshoot with your engaged specialist. Without this granular information, it is difficult in order to receive timely assistance. 
