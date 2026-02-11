@@ -68,7 +68,12 @@ param(
     [int]$DiskTestSize = 1
 )
 
-#Requires -RunAsAdministrator
+# Check for Administrator privileges (soft check - warn but continue)
+$script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+if (-not $script:IsAdmin) {
+    Write-Warning "This script works best with Administrator privileges. Some diagnostics may be limited."
+    Write-Warning "Tip: Run PowerShell as Administrator for full functionality.`n"
+}
 
 # Global variables
 $script:Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -198,25 +203,29 @@ Function Get-SystemInformation {
 Function Get-PerformanceCounters {
     Write-ForensicsHeader "PERFORMANCE COUNTER COLLECTION"
     
-    Write-ForensicsLog "Resetting performance counters..." -Level Info
-    try {
-        Push-Location C:\Windows\System32
-        lodctr /R | Out-Null
-        Pop-Location
-        
-        Push-Location C:\Windows\SysWOW64
-        lodctr /R | Out-Null
-        Pop-Location
-        
-        winmgmt.exe /resyncperf | Out-Null
-        
-        Restart-Service -Name "pla" -Force -ErrorAction SilentlyContinue | Out-Null
-        Restart-Service -Name "winmgmt" -Force -ErrorAction SilentlyContinue | Out-Null
-        
-        Write-ForensicsLog "Performance counters reset successfully" -Level Success
-        Start-Sleep -Seconds 2
-    } catch {
-        Write-ForensicsLog "Warning: Failed to reset some counters: $_" -Level Warning
+    if ($script:IsAdmin) {
+        Write-ForensicsLog "Resetting performance counters..." -Level Info
+        try {
+            Push-Location C:\Windows\System32
+            lodctr /R | Out-Null
+            Pop-Location
+            
+            Push-Location C:\Windows\SysWOW64
+            lodctr /R | Out-Null
+            Pop-Location
+            
+            winmgmt.exe /resyncperf | Out-Null
+            
+            Restart-Service -Name "pla" -Force -ErrorAction SilentlyContinue | Out-Null
+            Restart-Service -Name "winmgmt" -Force -ErrorAction SilentlyContinue | Out-Null
+            
+            Write-ForensicsLog "Performance counters reset successfully" -Level Success
+            Start-Sleep -Seconds 2
+        } catch {
+            Write-ForensicsLog "Warning: Failed to reset some counters: $_" -Level Warning
+        }
+    } else {
+        Write-ForensicsLog "Skipping performance counter reset (requires Administrator)" -Level Warning
     }
     
     $counters = @(
@@ -390,8 +399,17 @@ Function Test-DiskPerformance {
         Write-ForensicsLog "Creating $($DiskTestSize)GB test file..." -Level Info
         $testFileSizeBytes = $DiskTestSize * 1GB
         
-        & fsutil file createnew $testFile $testFileSizeBytes | Out-Null
-        & fsutil file setvaliddata $testFile $testFileSizeBytes | Out-Null
+        if ($script:IsAdmin) {
+            & fsutil file createnew $testFile $testFileSizeBytes | Out-Null
+            & fsutil file setvaliddata $testFile $testFileSizeBytes | Out-Null
+        } else {
+            # Fallback: create test file using .NET when not admin (fsutil requires elevation)
+            Write-ForensicsLog "Using .NET file creation (fsutil requires admin)" -Level Warning
+            $stream = [System.IO.File]::Create($testFile)
+            $stream.SetLength([Math]::Min($testFileSizeBytes, 100MB))  # Cap at 100MB for non-admin
+            $stream.Close()
+            Write-ForensicsLog "Created reduced test file (100MB) for non-admin mode" -Level Warning
+        }
         
         Write-ForensicsLog "Test file created successfully" -Level Success
         
@@ -505,11 +523,11 @@ Function Get-CPUForensics {
         # Get top CPU consumers
         Write-ForensicsLog "`nTop 10 CPU-consuming processes:" -Level Info
         $topProcesses = Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 | 
-            Select-Object ProcessName, Id, CPU, WorkingSet, Threads
+            Select-Object ProcessName, Id, CPU, WorkingSet64, Threads
         
         foreach ($proc in $topProcesses) {
             $cpuTime = [math]::Round($proc.CPU, 2)
-            $memoryMB = [math]::Round($proc.WorkingSet / 1MB, 2)
+            $memoryMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
             Write-ForensicsLog "  $($proc.ProcessName) (PID: $($proc.Id)) - CPU: $cpuTime s, Memory: $memoryMB MB, Threads: $($proc.Threads.Count)" -Level Info
         }
         
@@ -524,7 +542,7 @@ Function Get-CPUForensics {
         }
         
         # Get thread count
-        $totalThreads = (Get-Process | Measure-Object -Property Threads -Sum).Sum
+        $totalThreads = (Get-Process | ForEach-Object { $_.Threads.Count } | Measure-Object -Sum).Sum
         Write-ForensicsLog "`nTotal system threads: $totalThreads" -Level Info
         
         if ($totalThreads -gt 2000) {
@@ -584,30 +602,32 @@ Function Get-MemoryForensics {
         
         # Get top memory consumers
         Write-ForensicsLog "`nTop 10 memory-consuming processes:" -Level Info
-        $topMemoryProcesses = Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 10 | 
-            Select-Object ProcessName, Id, WorkingSet, PrivateMemorySize, VirtualMemorySize
+        $topMemoryProcesses = Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 10 | 
+            Select-Object ProcessName, Id, WorkingSet64, PrivateMemorySize64, VirtualMemorySize64
         
         foreach ($proc in $topMemoryProcesses) {
-            $wsMB = [math]::Round($proc.WorkingSet / 1MB, 2)
-            $privateMB = [math]::Round($proc.PrivateMemorySize / 1MB, 2)
-            $virtualMB = [math]::Round($proc.VirtualMemorySize / 1MB, 2)
+            $wsMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
+            $privateMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
+            $virtualMB = [math]::Round($proc.VirtualMemorySize64 / 1MB, 2)
             Write-ForensicsLog "  $($proc.ProcessName) (PID: $($proc.Id)) - WS: $wsMB MB, Private: $privateMB MB, Virtual: $virtualMB MB" -Level Info
         }
         
-        # Check for memory leaks (processes with high virtual memory)
+        # Check for memory leaks (processes with high private memory relative to working set)
+        # Use PrivateMemorySize64 instead of VirtualMemorySize64 to avoid false positives
+        # from 64-bit address space reservations
         $potentialLeaks = Get-Process | Where-Object { 
-            $_.VirtualMemorySize -gt 2GB -and $_.WorkingSet -lt ($_.VirtualMemorySize * 0.3)
-        } | Select-Object -First 5
+            $_.PrivateMemorySize64 -gt 1GB -and $_.WorkingSet64 -lt ($_.PrivateMemorySize64 * 0.3)
+        } | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 5
         
         if ($potentialLeaks) {
             Write-ForensicsLog "`nPotential memory leaks detected:" -Level Warning
             foreach ($proc in $potentialLeaks) {
-                $virtualGB = [math]::Round($proc.VirtualMemorySize / 1GB, 2)
-                $wsGB = [math]::Round($proc.WorkingSet / 1GB, 2)
-                Write-ForensicsLog "  $($proc.ProcessName) (PID: $($proc.Id)) - Virtual: $virtualGB GB, Working Set: $wsGB GB" -Level Warning
+                $privateMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
+                $wsMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
+                Write-ForensicsLog "  $($proc.ProcessName) (PID: $($proc.Id)) - Private: $privateMB MB, Working Set: $wsMB MB" -Level Warning
                 
                 Add-Bottleneck -Category "Memory" -Issue "Potential memory leak in $($proc.ProcessName)" `
-                    -Value "$virtualGB GB virtual" -Threshold "2 GB" -Impact "Medium"
+                    -Value "$privateMB MB private" -Threshold "1 GB" -Impact "Medium"
             }
         }
         
@@ -627,9 +647,11 @@ Function Get-MemoryForensics {
         }
         
         # Check committed memory
-        $committedBytes = $os.TotalVirtualMemorySize * 1KB
-        $committedLimit = $os.TotalVisibleMemorySize * 1KB + ($pageFiles | Measure-Object -Property AllocatedBaseSize -Sum).Sum * 1MB
-        $commitPercent = ($committedBytes / $committedLimit) * 100
+        # TotalVirtualMemorySize = commit limit (physical + page file) in KB
+        # FreeVirtualMemory = uncommitted memory in KB
+        $committedLimit = $os.TotalVirtualMemorySize * 1KB
+        $committedBytes = ($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) * 1KB
+        $commitPercent = if ($committedLimit -gt 0) { ($committedBytes / $committedLimit) * 100 } else { 0 }
         
         Write-ForensicsLog "`nCommitted Memory: $([math]::Round($committedBytes / 1GB, 2)) GB / $([math]::Round($committedLimit / 1GB, 2)) GB ($([math]::Round($commitPercent, 2))%)" -Level Info
         
@@ -807,7 +829,7 @@ Function Get-StorageProfile {
                 
                 if ($disk) {
                     # Check if SSD
-                    $physDisk = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $diskNumber } -ErrorAction SilentlyContinue
+                    $physDisk = Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DeviceId -eq $diskNumber }
                     if ($physDisk -and $physDisk.MediaType -eq "SSD") {
                         $isSSD = $true
                     }
@@ -853,7 +875,7 @@ Function Get-StorageProfile {
                     
                     # Log bottleneck
                     $perfImpact = if ($isSSD) { "30-50% performance loss" } elseif ($isSAN) { "30-50% performance loss, increased SAN load" } else { "10-20% performance loss" }
-                    Add-Bottleneck -Category "Storage" -Issue "Misaligned partition: Disk $diskNumber Partition $partNumber ($driveLetter)" -CurrentValue "Offset ${offsetKB}KB" -Threshold "4K aligned (4096 bytes)" -Severity $severity
+                    Add-Bottleneck -Category "Storage" -Issue "Misaligned partition: Disk $diskNumber Partition $partNumber ($driveLetter) - $perfImpact" -Value "Offset ${offsetKB}KB" -Threshold "4K aligned (4096 bytes)" -Impact $severity
                 }
             }
         }
@@ -920,7 +942,7 @@ Function Get-StorageProfile {
         
         # Dev Drive detection (Windows 11 22H2+ / Server 2025)
         try {
-            $devDrives = Get-Volume | Where-Object { $_.FileSystemType -eq "ReFS" -and $_.AllocationUnitSize -eq 65536 }
+            $devDrives = Get-Volume | Where-Object { $_.FileSystem -eq "ReFS" -and $_.AllocationUnitSize -eq 65536 }
             if ($devDrives) {
                 Write-ForensicsLog "`nDev Drives (Performance Mode Volumes):" -Level Info
                 foreach ($dd in $devDrives) {
@@ -1403,6 +1425,82 @@ list volume
 
 #endregion
 
+#region Network Forensics
+
+Function Get-NetworkForensics {
+    Write-ForensicsHeader "NETWORK FORENSICS"
+    
+    if ($Mode -eq 'DiskOnly' -or $Mode -eq 'CPUOnly' -or $Mode -eq 'MemoryOnly') {
+        Write-ForensicsLog "Skipping network forensics in $Mode mode" -Level Info
+        return
+    }
+    
+    try {
+        # Network adapter information
+        Write-ForensicsLog "Network Adapters:" -Level Info
+        $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+        foreach ($adapter in $adapters) {
+            Write-ForensicsLog "  $($adapter.Name): $($adapter.InterfaceDescription) - $($adapter.LinkSpeed)" -Level Info
+        }
+        
+        # TCP connection summary
+        Write-ForensicsLog "`nTCP Connection Summary:" -Level Info
+        $tcpConnections = Get-NetTCPConnection -ErrorAction SilentlyContinue | Group-Object State
+        foreach ($group in $tcpConnections) {
+            Write-ForensicsLog "  $($group.Name): $($group.Count)" -Level Info
+        }
+        
+        # Check for excessive TIME_WAIT
+        $timeWaitCount = ($tcpConnections | Where-Object { $_.Name -eq 'TimeWait' }).Count
+        if ($timeWaitCount -gt 5000) {
+            Add-Bottleneck -Category "Network" -Issue "Excessive TIME_WAIT connections" `
+                -Value "$timeWaitCount" -Threshold "5000" -Impact "Medium"
+        }
+        
+        # Check for high ESTABLISHED connections
+        $establishedCount = ($tcpConnections | Where-Object { $_.Name -eq 'Established' }).Count
+        Write-ForensicsLog "`nTotal Established Connections: $establishedCount" -Level Info
+        
+        # Top listening ports
+        Write-ForensicsLog "`nTop Listening Ports:" -Level Info
+        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | 
+            Select-Object LocalPort, OwningProcess | 
+            Sort-Object LocalPort -Unique | 
+            Select-Object -First 20 | ForEach-Object {
+                $procName = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+                Write-ForensicsLog "  Port $($_.LocalPort) - $procName (PID: $($_.OwningProcess))" -Level Info
+            }
+        
+        # Network errors from adapter statistics
+        Write-ForensicsLog "`nNetwork Adapter Statistics:" -Level Info
+        foreach ($adapter in $adapters) {
+            $stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
+            if ($stats) {
+                Write-ForensicsLog "  $($adapter.Name):" -Level Info
+                Write-ForensicsLog "    Sent: $([math]::Round($stats.SentBytes / 1MB, 2)) MB | Received: $([math]::Round($stats.ReceivedBytes / 1MB, 2)) MB" -Level Info
+                Write-ForensicsLog "    Outbound Errors: $($stats.OutboundPacketErrors) | Inbound Errors: $($stats.InboundPacketErrors)" -Level Info
+                
+                if ($stats.OutboundPacketErrors -gt 0 -or $stats.InboundPacketErrors -gt 0) {
+                    Add-Bottleneck -Category "Network" -Issue "Network packet errors on $($adapter.Name)" `
+                        -Value "Out: $($stats.OutboundPacketErrors), In: $($stats.InboundPacketErrors)" -Threshold "0" -Impact "Medium"
+                }
+            }
+        }
+        
+        $script:DiagnosticData['NetworkForensics'] = @{
+            Adapters = $adapters
+            TCPConnections = $tcpConnections
+        }
+        
+        Write-ForensicsLog "`nNetwork forensics completed" -Level Success
+        
+    } catch {
+        Write-ForensicsLog "Error during network forensics: $_" -Level Error
+    }
+}
+
+#endregion
+
 #region Database Forensics
 
 Function Get-DatabaseForensics {
@@ -1815,7 +1913,8 @@ db.system.profile.find().sort({millis: -1}).limit(5).forEach(function(op) {
     }
     
     # Cassandra Detection
-    $cassandraProcesses = Get-Process | Where-Object { $_.ProcessName -like "java*" -and $_.CommandLine -like "*cassandra*" }
+    $cassandraProcesses = Get-CimInstance Win32_Process -Filter "Name LIKE 'java%'" -ErrorAction SilentlyContinue | 
+        Where-Object { $_.CommandLine -like "*cassandra*" } | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
     if ($cassandraProcesses) {
         $databasesFound = $true
         Write-ForensicsLog "`n=== Cassandra Detected ===" -Level Info
@@ -1837,7 +1936,8 @@ db.system.profile.find().sort({millis: -1}).limit(5).forEach(function(op) {
     }
     
     # Elasticsearch Detection
-    $elasticsearchProcesses = Get-Process | Where-Object { $_.ProcessName -like "java*" -and $_.CommandLine -like "*elasticsearch*" }
+    $elasticsearchProcesses = Get-CimInstance Win32_Process -Filter "Name LIKE 'java%'" -ErrorAction SilentlyContinue | 
+        Where-Object { $_.CommandLine -like "*elasticsearch*" } | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
     if ($elasticsearchProcesses) {
         $databasesFound = $true
         Write-ForensicsLog "`n=== Elasticsearch Detected ===" -Level Info
@@ -2151,16 +2251,16 @@ Function Invoke-Forensics {
     $startTime = Get-Date
     
     # Banner
-    Write-Host "`n" -NoNewline
-    Write-Host "╔═══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                                                                               ║" -ForegroundColor Cyan
-    Write-Host "║                WINDOWS PERFORMANCE FORENSICS TOOL v2.0                    ║" -ForegroundColor Cyan
-    Write-Host "║                                                                               ║" -ForegroundColor Cyan
-    Write-Host "║                    Comprehensive System Diagnostics                           ║" -ForegroundColor Cyan
-    Write-Host "║                    with AWS Support Integration                               ║" -ForegroundColor Cyan
-    Write-Host "║                                                                               ║" -ForegroundColor Cyan
-    Write-Host "╚═══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host "`n"
+    Write-Host ""
+    Write-Host "+============================================================================+" -ForegroundColor Cyan
+    Write-Host "|                                                                            |" -ForegroundColor Cyan
+    Write-Host "|              WINDOWS PERFORMANCE FORENSICS TOOL v2.0                       |" -ForegroundColor Cyan
+    Write-Host "|                                                                            |" -ForegroundColor Cyan
+    Write-Host "|                  Comprehensive System Diagnostics                          |" -ForegroundColor Cyan
+    Write-Host "|                  with AWS Support Integration                              |" -ForegroundColor Cyan
+    Write-Host "|                                                                            |" -ForegroundColor Cyan
+    Write-Host "+============================================================================+" -ForegroundColor Cyan
+    Write-Host ""
     
     Write-ForensicsLog "Starting forensics analysis in $Mode mode..." -Level Info
     Write-ForensicsLog "Output file: $script:OutputFile" -Level Info
@@ -2172,6 +2272,8 @@ Function Invoke-Forensics {
     switch ($Mode) {
         'Quick' {
             Get-PerformanceCounters
+            Get-CPUForensics
+            Get-MemoryForensics
         }
         'Standard' {
             Get-PerformanceCounters
@@ -2179,6 +2281,7 @@ Function Invoke-Forensics {
             Get-StorageProfile
             Get-CPUForensics
             Get-MemoryForensics
+            Get-NetworkForensics
             Get-DatabaseForensics
         }
         'Deep' {
@@ -2187,6 +2290,7 @@ Function Invoke-Forensics {
             Get-StorageProfile
             Get-CPUForensics
             Get-MemoryForensics
+            Get-NetworkForensics
             Get-DatabaseForensics
         }
         'DiskOnly' {
@@ -2219,36 +2323,36 @@ Function Invoke-Forensics {
         Write-Host "`n"
         
         # Group by impact
-        $critical = $script:Bottlenecks | Where-Object { $_.Impact -eq 'Critical' }
-        $high = $script:Bottlenecks | Where-Object { $_.Impact -eq 'High' }
-        $medium = $script:Bottlenecks | Where-Object { $_.Impact -eq 'Medium' }
-        $low = $script:Bottlenecks | Where-Object { $_.Impact -eq 'Low' }
+            $critical = @($script:Bottlenecks | Where-Object { $_.Impact -eq 'Critical' })
+            $high = @($script:Bottlenecks | Where-Object { $_.Impact -eq 'High' })
+            $medium = @($script:Bottlenecks | Where-Object { $_.Impact -eq 'Medium' })
+            $low = @($script:Bottlenecks | Where-Object { $_.Impact -eq 'Low' })
         
-        if ($critical) {
+        if ($critical.Count -gt 0) {
             Write-Host "  CRITICAL ISSUES ($($critical.Count)):" -ForegroundColor Red
             foreach ($issue in $critical) {
-                Write-Host "    • $($issue.Category): $($issue.Issue)" -ForegroundColor Red
+                Write-Host "    * $($issue.Category): $($issue.Issue)" -ForegroundColor Red
             }
         }
         
-        if ($high) {
+        if ($high.Count -gt 0) {
             Write-Host "  HIGH PRIORITY ($($high.Count)):" -ForegroundColor Yellow
             foreach ($issue in $high) {
-                Write-Host "    • $($issue.Category): $($issue.Issue)" -ForegroundColor Yellow
+                Write-Host "    * $($issue.Category): $($issue.Issue)" -ForegroundColor Yellow
             }
         }
         
-        if ($medium) {
+        if ($medium.Count -gt 0) {
             Write-Host "  MEDIUM PRIORITY ($($medium.Count)):" -ForegroundColor Yellow
             foreach ($issue in $medium) {
-                Write-Host "    • $($issue.Category): $($issue.Issue)" -ForegroundColor Yellow
+                Write-Host "    * $($issue.Category): $($issue.Issue)" -ForegroundColor Yellow
             }
         }
         
-        if ($low) {
+        if ($low.Count -gt 0) {
             Write-Host "  LOW PRIORITY ($($low.Count)):" -ForegroundColor Gray
             foreach ($issue in $low) {
-                Write-Host "    • $($issue.Category): $($issue.Issue)" -ForegroundColor Gray
+                Write-Host "    * $($issue.Category): $($issue.Issue)" -ForegroundColor Gray
             }
         }
     }
@@ -2267,11 +2371,11 @@ Function Invoke-Forensics {
         Write-Host "`nTip: Run with -CreateSupportCase to automatically open an AWS Support case" -ForegroundColor Cyan
     }
     
-    Write-Host "`n"
-    Write-Host "═══════════════════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "                         Forensics Analysis Complete                            " -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "`n"
+    Write-Host ""
+    Write-Host "==============================================================================" -ForegroundColor Cyan
+    Write-Host "                         Forensics Analysis Complete                           " -ForegroundColor Cyan
+    Write-Host "==============================================================================" -ForegroundColor Cyan
+    Write-Host ""
 }
 
 # Execute main function
